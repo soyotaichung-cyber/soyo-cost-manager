@@ -3,6 +3,11 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="SOYO">
+<meta name="theme-color" content="#F7F5F0">
+<link rel="manifest" href="manifest.json">
 <title>SOYO 成本管理</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -136,6 +141,13 @@ select.field-input{cursor:pointer}
   .product-results{grid-template-columns:1fr 1fr}
   .tabs{overflow-x:auto}
 }
+
+/* sync indicator */
+.sync-bar{position:fixed;bottom:16px;right:16px;display:flex;align-items:center;gap:6px;font-size:12px;padding:6px 12px;border-radius:20px;border:1px solid #e5e2db;background:#fff;box-shadow:0 2px 8px rgba(0,0,0,0.08);transition:opacity .3s;z-index:999}
+.sync-dot{width:8px;height:8px;border-radius:50%;background:#5cb85c;flex-shrink:0}
+.sync-dot.saving{background:#f0a500;animation:pulse .8s infinite}
+.sync-dot.error{background:#e57373}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 </style>
 </head>
 <body>
@@ -196,8 +208,98 @@ select.field-input{cursor:pointer}
     <div class="cal-info" id="cal-info"></div>
   </div>
 </div>
+<div class="sync-bar" id="sync-bar"><span class="sync-dot" id="sync-dot"></span><span id="sync-label">已連線</span></div>
 
 <script>
+
+/* ──────────────── SUPABASE CONFIG ──────────────── */
+const SUPABASE_URL = 'https://iohqtnjdzzrslhcbqzcq.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlvaHF0bmpkenpyc2xoY2JxemNxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzcxMTAxNzgsImV4cCI6MjA5MjY4NjE3OH0.FgJl0fd0itNPqtvrQ2TFbDTH1WeR7f53RaRD1-m9bnU';
+const DATA_ROW_ID  = 'soyo_main';
+let saveTimer = null;
+
+async function sbFetch(path, options={}) {
+  return fetch(SUPABASE_URL + path, {
+    ...options,
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': 'Bearer ' + SUPABASE_KEY,
+      'Content-Type': 'application/json',
+      'Prefer': 'return=minimal',
+      ...(options.headers||{})
+    }
+  });
+}
+
+function setSyncStatus(status, label) {
+  const dot = document.getElementById('sync-dot');
+  const lbl = document.getElementById('sync-label');
+  if(!dot||!lbl) return;
+  dot.className = 'sync-dot' + (status==='saving'?' saving': status==='error'?' error':'');
+  lbl.textContent = label;
+}
+
+async function saveToCloud() {
+  setSyncStatus('saving','儲存中…');
+  const payload = {
+    id: DATA_ROW_ID,
+    data: JSON.stringify({
+      categories: state.categories,
+      openCategories: state.openCategories,
+      renovationMonths: state.renovationMonths,
+      products: state.products,
+      calDays: state.calDays
+    }),
+    updated_at: new Date().toISOString()
+  };
+  try {
+    const r = await sbFetch('/rest/v1/app_data', {
+      method: 'POST',
+      headers: { 'Prefer': 'resolution=merge-duplicates' },
+      body: JSON.stringify(payload)
+    });
+    if(r.ok || r.status===200||r.status===201||r.status===204) {
+      setSyncStatus('ok','已儲存 ✓');
+    } else {
+      const txt = await r.text();
+      setSyncStatus('error','儲存失敗');
+      console.error('Save error', r.status, txt);
+    }
+  } catch(e) {
+    setSyncStatus('error','離線');
+    console.error(e);
+  }
+}
+
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveToCloud, 800);
+}
+
+async function loadFromCloud() {
+  setSyncStatus('saving','載入中…');
+  try {
+    const r = await sbFetch('/rest/v1/app_data?id=eq.' + DATA_ROW_ID + '&select=data');
+    if(!r.ok) { setSyncStatus('error','載入失敗'); return false; }
+    const rows = await r.json();
+    if(!rows || rows.length===0) { setSyncStatus('ok','尚無雲端資料'); return false; }
+    const saved = JSON.parse(rows[0].data);
+    if(saved.categories)       state.categories       = saved.categories;
+    if(saved.openCategories)   state.openCategories   = saved.openCategories;
+    if(saved.renovationMonths) state.renovationMonths = saved.renovationMonths;
+    if(saved.products)         state.products         = saved.products;
+    if(saved.calDays)          state.calDays          = saved.calDays;
+    // restore pid counter
+    if(state.products.length>0) pid = Math.max(...state.products.map(p=>p.id||0));
+    setSyncStatus('ok','已同步 ✓');
+    return true;
+  } catch(e) {
+    setSyncStatus('error','離線');
+    console.error(e);
+    return false;
+  }
+}
+
 /* ──────────────── STATE ──────────────── */
 const CATEGORIES = [
   {id:'rent',       name:'店租',      icon:'🏠', bg:'#EBF4FD'},
@@ -391,6 +493,7 @@ function attachCategoryInputs(){
       state.categories[cat][idx][field]=e.target.value;
       refreshCategoryTotal(cat);
       renderSummary();
+      scheduleSave();
     });
   });
 }
@@ -418,11 +521,13 @@ function toggleCat(catId){
 }
 function updateRenovationMonths(val){
   state.renovationMonths=Math.max(1,parseInt(val)||1);
+  scheduleSave();
   refreshCategoryTotal('renovation');
   renderSummary();
 }
 function addItem(catId){
   state.categories[catId].push({name:'',amount:''});
+  scheduleSave();
   renderCategories();
 }
 function deleteItem(catId,idx){
@@ -433,11 +538,13 @@ function deleteItem(catId,idx){
   }
   renderCategories();
   renderSummary();
+  scheduleSave();
 }
 
 /* ──────────────── PRODUCTS ──────────────── */
 function addProduct(){
   state.products.push({id:++pid,name:'',type:'熱飲',ingredientCost:'',targetDailyQty:0});
+  scheduleSave();
   renderProducts();
   // Focus name input of new card without re-render
   setTimeout(()=>{
@@ -448,6 +555,7 @@ function addProduct(){
 
 function deleteProduct(id){
   state.products=state.products.filter(x=>x.id!==id);
+  scheduleSave();
   renderProducts();
 }
 
@@ -585,6 +693,7 @@ function buildProductCard(p){
       } else {
         prod[field]=e.target.value;
       }
+      scheduleSave();
       // Only update results, not the entire card
       const c2=calcProduct(prod);
       const resEl=document.getElementById('prod-results-'+pid);
@@ -781,6 +890,7 @@ function renderCalendar(){
 function toggleCalDay(key){
   const current=state.calDays[key]||'undecided';
   state.calDays[key]=state.calMode;
+  scheduleSave();
   // Update just this cell
   const cell=document.querySelector(`[data-key="${key}"]`);
   if(cell){
@@ -849,9 +959,20 @@ document.addEventListener('input',e=>{
 });
 
 /* ──────────────── INIT ──────────────── */
-renderSummary();
-renderCategories();
-renderCalendar();
+(async()=>{
+  const loaded = await loadFromCloud();
+  renderSummary();
+  renderCategories();
+  renderCalendar();
+  if(loaded) renderProducts();
+})();
+</script>
+<script>
+if('serviceWorker' in navigator){
+  window.addEventListener('load',()=>{
+    navigator.serviceWorker.register('./sw.js').catch(()=>{});
+  });
+}
 </script>
 </body>
 </html>
